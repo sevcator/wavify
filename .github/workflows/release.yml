@@ -1,0 +1,78 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (must match Cargo.toml, for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Determine and validate release version
+        id: release
+        shell: pwsh
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          $match = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"')
+          if (-not $match.Success) { throw 'Could not read package version from Cargo.toml' }
+          $packageVersion = $match.Groups[1].Value
+          $requested = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          $releaseVersion = $requested.TrimStart('v')
+          if ($releaseVersion -ne $packageVersion) {
+            throw "Release tag $requested does not match Cargo.toml version $packageVersion"
+          }
+          "tag=$requested" >> $env:GITHUB_OUTPUT
+          "version=$releaseVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Build Wavify
+        env:
+          WAVIFY_GITHUB_REPOSITORY: ${{ github.repository }}
+        run: cargo +nightly build --release --target x86_64-pc-windows-gnu --bin wavify
+
+      - name: Verify runtime loader and prepare installer inputs
+        shell: pwsh
+        run: |
+          $buildDir = 'target/x86_64-pc-windows-gnu/release'
+          if (-not (Test-Path "$buildDir/wavify.exe")) { throw 'Release executable was not produced' }
+          $loader = Get-ChildItem 'target/x86_64-pc-windows-gnu/release/build/webview2-com-sys' -Filter WebView2Loader.dll -Recurse |
+            Where-Object { $_.FullName -match '\\out\\x64\\WebView2Loader\.dll$' } |
+            Select-Object -First 1
+          if (-not $loader) { throw 'The x64 WebView2Loader.dll was not produced by the build' }
+          Copy-Item -LiteralPath $loader.FullName -Destination "$buildDir/WebView2Loader.dll" -Force
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile 'dist/MicrosoftEdgeWebview2Setup.exe'
+
+      - name: Build per-user installer
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.release.outputs.version }}" "/DBuildDir=..\target\x86_64-pc-windows-gnu\release" installer\Wavify.iss'
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.release.outputs.tag }}'
+          $notes = Get-Content CHANGELOG.md -Raw
+          $notesPath = Join-Path $env:RUNNER_TEMP 'wavify-release-notes.md'
+          Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8
+          gh release create $tag 'dist/Wavify-Setup.exe' --repo '${{ github.repository }}' --title "Wavify $tag" --notes-file $notesPath --target '${{ github.sha }}' --latest

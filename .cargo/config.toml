@@ -1,0 +1,11 @@
+# Link with lld, not GNU ld. Several crates bring their own import library
+# for the same DLL (for kernel32.dll: std, windows-sys 0.61, libloading and
+# parking_lot_core), each with an import descriptor of the same name. GNU ld
+# keeps only the first; the other libraries' functions are never bound, and
+# Wavify dies with an access violation before main(), in whichever build the
+# link order happens to put std's imports among them. lld builds the import
+# table per DLL from all of them. (`gnu-lld` is still an unstable flavor
+# name: this needs the nightly toolchain, which the project already uses.)
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"
+rustflags = ["-Clinker-flavor=gnu-lld", "-Zunstable-options"]

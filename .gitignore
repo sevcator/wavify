@@ -1,0 +1,21 @@
+# Rust build artifacts and release packages
+target/
+**/target/
+dist/
+
+# WebView2 user data
+*.WebView2/
+**/*.WebView2/
+
+# Logs and test output
+*.log
+**/*.log
+test_run_results.log
+
+# Generated reports and local captures
+*.html
+
+# OS metadata
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store

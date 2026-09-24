@@ -1,0 +1,57 @@
+[package]
+name = "wavify"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wavify"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wavify"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_all_soundcloud"
+path = "src/bin/test_all_soundcloud.rs"
+
+
+[dependencies]
+iced = { version = "0.13.1", features = ["image", "tokio", "canvas", "advanced"] }
+image = { version = "0.24", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "json", "socks", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
+open = "5"
+directories = "5"
+rodio = { version = "=0.19.0", features = ["symphonia-aac", "symphonia-isomp4"] }
+futures-util = "0.3"
+anyhow = "1"
+hex = "0.4"
+wry = "0.24.1"
+# reqwest's own http types, to hand back a refused answer after reading it
+http = "1"
+# iced / wgpu messages into the --debug log
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_System_Pipes"] }
+
+# iced_wgpu 0.13.5 with one fix (see its lib.rs, "Wavify patch"): a layer
+# off the window threw every later layer's text, quads and images out of
+# step, so menus, toasts and labels drew empty.
+[patch.crates-io]
+iced_wgpu = { path = "vendor/iced_wgpu" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+# NOTE: do NOT add `strip` here. On the x86_64-pc-windows-gnu (MinGW) target it
+# corrupts this binary's import table, so the loader calls an unresolved thunk
+# and the process dies with an access violation before main() ever runs.
