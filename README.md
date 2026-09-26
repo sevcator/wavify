@@ -11,8 +11,9 @@
 <h1 align="center">Wavify</h1>
 
 <div align="center">
-  SoundCloud for your Desktop devices!
+  Free Spotify for your Desktop devices! (but this SoundCloud)
 </div>
+
 
 <div align="center">
   <a href="https://t.me/sevcator/921">📢 Telegram Channel</a> | 
