@@ -19,7 +19,7 @@
   <br>
   <br>
   <img src="assets/preview.png" alt="Wavify Preview" width="800">
-</p>
+</div>
 
 # Features:
 - Spotify Theme
