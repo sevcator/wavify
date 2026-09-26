@@ -114,21 +114,29 @@ impl Read for PipeSource {
 impl Seek for PipeSource {
     fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
         let target = match p {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::End(o) => self.available() as i64 + o,
-            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::Start(o) => i64::try_from(o).unwrap_or(i64::MAX),
+            SeekFrom::End(o) => {
+                // A growing pipe has no meaningful end position yet. Returning
+                // the current cursor here violates Seek's contract; Symphonia's
+                // ISO-MP4 demuxer uses end-relative seeks while probing fMP4 and
+                // can panic when that bogus position is treated as file length.
+                // Wait for the loader to finish (or this generation to go stale)
+                // before resolving the real end.
+                while !self.done.load(Ordering::Relaxed) && !self.is_stale() {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                (self.available() as i64).saturating_add(o)
+            }
+            SeekFrom::Current(o) => (self.pos as i64).saturating_add(o),
         };
         // A seek while the download runs works like one in a file whose tail
         // is still being written. Going back is into data already here: MP3's
         // seek rewinds to the first frame, then reads forward to the target
         // (refusing that made every backward seek fail until the whole track
         // was in). Going past the data waits for it, as a read does (symphonia
-        // skips big blocks by seeking and doesn't check where it landed). The
-        // end isn't known yet: that keeps the position, and says so.
+        // skips big blocks by seeking and doesn't check where it landed). An
+        // end-relative seek waits above until the loader provides a real end.
         if !self.done.load(Ordering::Relaxed) {
-            if matches!(p, SeekFrom::End(_)) {
-                return Ok(self.pos as u64);
-            }
             while target > self.available() as i64
                 && !self.done.load(Ordering::Relaxed)
                 && !self.is_stale()
@@ -149,9 +157,11 @@ fn blocking_client(proxy: Option<&str>) -> reqwest::blocking::Client {
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10));
-    let proxy = proxy
-        .or(settings.proxy.as_deref())
-        .filter(|p| !p.is_empty());
+    let configured_proxy = settings
+        .proxy
+        .as_deref()
+        .filter(|p| !p.is_empty() && crate::proxy_pool::configured_proxy_is_verified(p));
+    let proxy = proxy.or(configured_proxy).filter(|p| !p.is_empty());
     if let Some(p) = proxy.and_then(|p| reqwest::Proxy::all(p).ok()) {
         b = b.proxy(p);
     }
@@ -187,22 +197,58 @@ fn start_loader(
                     done.store(true, Ordering::Relaxed);
                     return;
                 }
+                crate::dlog!(
+                    "player: GET stream chunk {}/{} {}",
+                    i + 1,
+                    total,
+                    crate::console::redact(url)
+                );
                 match client.get(url).send() {
                     // An error page (403 on an expired URL, 5xx) is not audio:
                     // retry instead of appending it to the stream.
                     Ok(resp) if !resp.status().is_success() => {
+                        let status = resp.status();
+                        let response_url = resp.url().to_string();
+                        crate::dlog!(
+                            "player: chunk response {} -> HTTP {}",
+                            crate::console::redact(&response_url),
+                            status
+                        );
+                        if let Ok(body) = resp.bytes() {
+                            crate::console::http_response("GET", &response_url, status, &body);
+                        }
                         crate::log!(
                             "player: chunk {}/{} fetch attempt {} FAILED: HTTP {}",
                             i + 1,
                             total,
                             attempt + 1,
-                            resp.status()
+                            status
                         );
                     }
                     Ok(mut resp) => {
+                        let status = resp.status();
+                        let response_url = resp.url().to_string();
+                        let content_type = resp
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        crate::dlog!(
+                            "player: chunk response {} -> HTTP {}, content-length={:?}",
+                            crate::console::redact(&response_url),
+                            status,
+                            resp.content_length()
+                        );
                         let mut chunk_data = Vec::new();
                         use std::io::Read as _;
                         if resp.read_to_end(&mut chunk_data).is_ok() {
+                            crate::console::http_binary_response(
+                                "GET",
+                                &response_url,
+                                status,
+                                content_type.as_deref(),
+                                chunk_data.len(),
+                            );
                             if let Ok(mut b) = buf.lock() {
                                 b.extend_from_slice(&chunk_data);
                             }
@@ -530,8 +576,28 @@ fn open_cached(track_id: i64) -> Option<Decoder<std::io::BufReader<std::fs::File
     {
         return None;
     }
-    let file = std::fs::File::open(&cache_path).ok()?;
-    rodio::Decoder::new(std::io::BufReader::new(file)).ok()
+    match decode_cached_file(&cache_path) {
+        Ok(decoder) => Some(decoder),
+        Err(error) => {
+            crate::log!("player: invalid cached audio for track {track_id}: {error}; removing it");
+            let _ = std::fs::remove_file(cache_path);
+            None
+        }
+    }
+}
+
+/// Decode cached media without allowing a decoder panic to kill the command
+/// thread. Symphonia can panic on unusual or malformed media during probing.
+fn decode_cached_file(
+    path: &std::path::Path,
+) -> Result<Decoder<std::io::BufReader<std::fs::File>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open failed: {e}"))?;
+    let reader = std::io::BufReader::new(file);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Decoder::new(reader))) {
+        Ok(Ok(decoder)) => Ok(decoder),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("decoder panicked while opening cached audio".to_string()),
+    }
 }
 
 pub fn spawn() -> Result<PlayerHandle> {
@@ -620,26 +686,15 @@ pub fn spawn() -> Result<PlayerHandle> {
                         "player: playing cached audio ({track_id}) from {}",
                         path.display()
                     );
-                    match std::fs::File::open(&path) {
-                        Ok(file) => {
-                            let reader = std::io::BufReader::new(file);
-                            match rodio::Decoder::new(reader) {
-                                Ok(dec) => {
-                                    if play_decoded(&sh, &t, dec) {
-                                        crate::log!(
-                                            "player: playing (cached disk file: {track_id})"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    crate::log!("player: decode cached file FAILED: {e}");
-                                    let _ = std::fs::remove_file(&path);
-                                    *sh.state.lock().unwrap() = PlaybackState::Idle;
-                                }
+                    match decode_cached_file(&path) {
+                        Ok(dec) => {
+                            if play_decoded(&sh, &t, dec) {
+                                crate::log!("player: playing (cached disk file: {track_id})");
                             }
                         }
                         Err(e) => {
-                            crate::log!("player: open cached file FAILED: {e}");
+                            crate::log!("player: cached file decode FAILED: {e}");
+                            let _ = std::fs::remove_file(&path);
                             *sh.state.lock().unwrap() = PlaybackState::Idle;
                         }
                     }
@@ -685,14 +740,43 @@ pub fn spawn() -> Result<PlayerHandle> {
                         let check = || {
                             my_gen != gen.load(Ordering::SeqCst) || done2.load(Ordering::Relaxed)
                         };
+                        crate::dlog!("player: GET stream {}", crate::console::redact(&url));
                         match client2.get(&url).send() {
                             // An error page (403 on an expired URL, 5xx) is not
                             // audio: it must reach neither the decoder nor the cache.
                             Ok(resp) if !resp.status().is_success() => {
-                                crate::log!("player: download FAILED: HTTP {}", resp.status());
+                                let status = resp.status();
+                                let response_url = resp.url().to_string();
+                                crate::dlog!(
+                                    "player: stream response {} -> HTTP {}",
+                                    crate::console::redact(&response_url),
+                                    status
+                                );
+                                if let Ok(body) = resp.bytes() {
+                                    crate::console::http_response(
+                                        "GET",
+                                        &response_url,
+                                        status,
+                                        &body,
+                                    );
+                                }
+                                crate::log!("player: download FAILED: HTTP {status}");
                                 done2.store(true, Ordering::Relaxed);
                             }
                             Ok(mut resp) => {
+                                let status = resp.status();
+                                let response_url = resp.url().to_string();
+                                let content_type = resp
+                                    .headers()
+                                    .get(reqwest::header::CONTENT_TYPE)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string);
+                                crate::dlog!(
+                                    "player: stream response {} -> HTTP {}, content-length={:?}",
+                                    crate::console::redact(&response_url),
+                                    status,
+                                    resp.content_length()
+                                );
                                 use std::io::Read as _;
                                 let expected = resp.content_length();
                                 // Set only when the body ended cleanly: every later
@@ -722,6 +806,15 @@ pub fn spawn() -> Result<PlayerHandle> {
                                     }
                                 }
                                 done2.store(true, Ordering::Relaxed);
+
+                                let received = buf2.lock().map(|buffer| buffer.len()).unwrap_or(0);
+                                crate::console::http_binary_response(
+                                    "GET",
+                                    &response_url,
+                                    status,
+                                    content_type.as_deref(),
+                                    received,
+                                );
 
                                 if let Some(tid) = track_id.filter(|_| keep.load(Ordering::Relaxed))
                                 {
@@ -963,5 +1056,37 @@ fn open_decoder(src: PipeSource) -> Result<Decoder<PipeSource>> {
         Ok(Ok(dec)) => Ok(dec),
         Ok(Err(e)) => anyhow::bail!("fallback decode init failed: {e}"),
         Err(_) => anyhow::bail!("fallback decoder panicked during initialization"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_relative_seek_waits_for_final_pipe_length() {
+        let buf = Arc::new(Mutex::new(b"abc".to_vec()));
+        let done = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(1));
+        let loader_buf = buf.clone();
+        let loader_done = done.clone();
+        let loader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            loader_buf.lock().unwrap().extend_from_slice(b"def");
+            loader_done.store(true, Ordering::Relaxed);
+        });
+
+        let mut src = PipeSource {
+            buf,
+            pos: 0,
+            done,
+            generation,
+            my_gen: 1,
+        };
+        assert_eq!(src.seek(SeekFrom::End(-1)).unwrap(), 5);
+        let mut last = [0; 1];
+        assert_eq!(src.read(&mut last).unwrap(), 1);
+        assert_eq!(&last, b"f");
+        loader.join().unwrap();
     }
 }

@@ -11,7 +11,7 @@
 //! them: requests via a proxy carry only the app's client id, never the
 //! OAuth token or the session cookies.
 
-use crate::api::{Api, StreamSource};
+use crate::api::{Api, StreamSource, Track};
 use crate::config::{config_dir, Settings, CLIENT_ID};
 use anyhow::{bail, Result};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -42,6 +42,15 @@ const MAX_TRIES: usize = 600;
 const LIST_TTL: Duration = Duration::from_secs(15 * 60);
 /// Proxies remembered as working.
 const KEEP_GOOD: usize = 16;
+/// A manually configured proxy may carry all SoundCloud traffic only after
+/// an anonymous SoundCloud request has proven the route works. Recheck every
+/// few minutes so a Tor exit or other proxy that went stale is not trusted.
+const CONFIGURED_PROXY_CHECK_TTL: Duration = Duration::from_secs(5 * 60);
+
+static VERIFIED_CONFIGURED_PROXY: std::sync::Mutex<Option<(String, Instant)>> =
+    std::sync::Mutex::new(None);
+static DIRECT_SOUNDCLOUD_CHECK: std::sync::Mutex<Option<(bool, Instant)>> =
+    std::sync::Mutex::new(None);
 
 #[derive(Default)]
 struct Pool {
@@ -110,6 +119,91 @@ pub fn client_via(proxy: &str) -> Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(6))
         .timeout(Duration::from_secs(15))
         .build()?)
+}
+
+/// Whether this exact configured proxy recently passed the SoundCloud probe.
+/// Callers that build ordinary app clients must never route through an
+/// unverified configured proxy.
+pub fn configured_proxy_is_verified(proxy: &str) -> bool {
+    VERIFIED_CONFIGURED_PROXY
+        .lock()
+        .ok()
+        .and_then(|verified| {
+            verified
+                .as_ref()
+                .filter(|(known, checked)| {
+                    known == proxy && checked.elapsed() < CONFIGURED_PROXY_CHECK_TTL
+                })
+                .map(|_| ())
+        })
+        .is_some()
+}
+
+async fn probe_soundcloud(client: reqwest::Client) -> Result<()> {
+    let response = client
+        .get("https://soundcloud.com/robots.txt")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let status = response.status();
+    let host = response
+        .url()
+        .host_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !status.is_success() || !(host == "soundcloud.com" || host.ends_with(".soundcloud.com")) {
+        bail!("SoundCloud probe returned HTTP {status} from {host}");
+    }
+    let _ = response.bytes().await?;
+    Ok(())
+}
+
+/// Check the direct route once per TTL, without sending account data. This
+/// lets startup explain that a proxy is needed when SoundCloud is blocked.
+pub async fn soundcloud_reachable_directly() -> bool {
+    if let Ok(check) = DIRECT_SOUNDCLOUD_CHECK.lock() {
+        if let Some((reachable, checked)) = check.as_ref() {
+            if checked.elapsed() < CONFIGURED_PROXY_CHECK_TTL {
+                return *reachable;
+            }
+        }
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(crate::config::USER_AGENT)
+        .connect_timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(10))
+        .build();
+    let reachable = match client {
+        Ok(client) => probe_soundcloud(client).await.is_ok(),
+        Err(_) => false,
+    };
+    if let Ok(mut check) = DIRECT_SOUNDCLOUD_CHECK.lock() {
+        *check = Some((reachable, Instant::now()));
+    }
+    crate::log!("direct SoundCloud route reachable: {reachable}");
+    reachable
+}
+
+/// Probe SoundCloud anonymously through the user's configured proxy before
+/// allowing it to become the app's primary route. The final response must
+/// still be hosted by SoundCloud, rejecting captive portals and block pages.
+pub async fn verify_configured_proxy(proxy: &str) -> Result<()> {
+    if configured_proxy_is_verified(proxy) {
+        return Ok(());
+    }
+
+    probe_soundcloud(
+        client_via(proxy)
+            .map_err(|e| anyhow::anyhow!("configured proxy is invalid or unavailable: {e}"))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("proxy did not reach SoundCloud: {e}"))?;
+
+    if let Ok(mut verified) = VERIFIED_CONFIGURED_PROXY.lock() {
+        *verified = Some((proxy.to_string(), Instant::now()));
+    }
+    crate::log!("configured proxy passed the SoundCloud reachability check");
+    Ok(())
 }
 
 /// The track's stream as seen through `proxy`, anonymously.
@@ -239,4 +333,139 @@ pub async fn resolve_via_proxies(track_id: i64, quality: &str) -> Result<(Stream
         }
     }
     bail!("no working proxy found ({tried} tried)")
+}
+
+async fn search_through_proxy(
+    proxy: &str,
+    query: &str,
+    cid: &str,
+    limit: usize,
+) -> Result<Vec<Track>> {
+    let api = Api::new(client_via(proxy)?, &Settings::default()).anonymous();
+    let list = if let Some(tag) = query
+        .strip_prefix('#')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        api.search_tracks_tagged(tag, cid, limit).await?
+    } else {
+        api.search_tracks(query, cid, limit).await?
+    };
+    Ok(list.collection)
+}
+
+/// Search anonymously through other regions as a supplement to the normal
+/// results. SoundCloud can omit geo-restricted tracks from the local search
+/// response entirely; no account token or cookies are sent through proxies.
+pub async fn search_tracks_via_proxies(
+    query: String,
+    cid: String,
+    known_ids: HashSet<i64>,
+    limit: usize,
+) -> Vec<Track> {
+    let (good, mut candidates, stale) = {
+        let mut guard = POOL.lock().await;
+        let pool = guard.get_or_insert_with(Pool::default);
+        pool.load_good();
+        let stale =
+            pool.fetched_at.map_or(true, |t| t.elapsed() > LIST_TTL) || pool.candidates.is_empty();
+        let good = pool.good.clone();
+        let candidates = if stale {
+            Vec::new()
+        } else {
+            pool.candidates
+                .iter()
+                .filter(|p| !pool.bad.contains(*p) && !pool.good.contains(*p))
+                .cloned()
+                .collect()
+        };
+        (good, candidates, stale)
+    };
+
+    let query = query.as_str();
+    let cid = cid.as_str();
+    let known_ids = std::sync::Arc::new(known_ids);
+    let find_novel = |tracks: Vec<Track>| {
+        tracks
+            .into_iter()
+            .filter(|track| !known_ids.contains(&track.id))
+            .collect::<Vec<_>>()
+    };
+
+    // Reuse bypasses already proven to reach playable SoundCloud regions.
+    for proxy in good.into_iter().take(4) {
+        match search_through_proxy(&proxy, query, cid, limit).await {
+            Ok(tracks) => {
+                let tracks = find_novel(tracks);
+                if !tracks.is_empty() {
+                    let mut guard = POOL.lock().await;
+                    guard.get_or_insert_with(Pool::default).promote(&proxy);
+                    return tracks;
+                }
+            }
+            Err(e) => {
+                crate::log!("bypass search: known proxy {proxy} failed: {e}");
+                mark_dead(&proxy).await;
+            }
+        }
+    }
+
+    if stale {
+        let skip = {
+            let mut guard = POOL.lock().await;
+            let pool = guard.get_or_insert_with(Pool::default);
+            pool.load_good();
+            pool.bad
+                .iter()
+                .chain(pool.good.iter())
+                .cloned()
+                .collect::<HashSet<_>>()
+        };
+        candidates = fetch_candidates(&skip).await;
+        let mut guard = POOL.lock().await;
+        let pool = guard.get_or_insert_with(Pool::default);
+        pool.candidates = candidates.clone();
+        pool.fetched_at = Some(Instant::now());
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut queue = candidates.into_iter().take(48);
+    let mut running = FuturesUnordered::new();
+    let spawn = |proxy: String| {
+        let q = query.to_string();
+        let cid = cid.to_string();
+        async move {
+            let result = search_through_proxy(&proxy, &q, &cid, limit).await;
+            (proxy, result)
+        }
+    };
+    for proxy in queue.by_ref().take(PARALLEL) {
+        running.push(spawn(proxy));
+    }
+    while let Some((proxy, result)) = running.next().await {
+        match result {
+            Ok(tracks) => {
+                let tracks = find_novel(tracks);
+                if !tracks.is_empty() {
+                    let mut guard = POOL.lock().await;
+                    guard.get_or_insert_with(Pool::default).promote(&proxy);
+                    crate::log!(
+                        "bypass search: found {} additional tracks via {proxy}",
+                        tracks.len()
+                    );
+                    return tracks;
+                }
+            }
+            Err(e) => {
+                crate::log!("bypass search: proxy {proxy} failed: {e}");
+                mark_dead(&proxy).await;
+            }
+        }
+        if let Some(next) = queue.next() {
+            running.push(spawn(next));
+        }
+    }
+    Vec::new()
 }

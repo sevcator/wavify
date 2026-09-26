@@ -28,7 +28,9 @@ sha2 = "0.10"
 rand = "0.8"
 open = "5"
 directories = "5"
-rodio = { version = "=0.19.0", features = ["symphonia-aac", "symphonia-isomp4"] }
+# Use Symphonia's Rust decoders for all supported formats. This avoids
+# minimp3-sys' C build and its extra MinGW compiler dependency.
+rodio = { version = "=0.19.0", default-features = false, features = ["symphonia-all"] }
 futures-util = "0.3"
 anyhow = "1"
 hex = "0.4"
@@ -37,10 +39,12 @@ wry = "0.24.1"
 http = "1"
 # iced / wgpu messages into the --debug log
 log = "0.4"
+arboard = "3.6"
+rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
-windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_System_Pipes"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_Pipes"] }
 
 # iced_wgpu 0.13.5 with one fix (see its lib.rs, "Wavify patch"): a layer
 # off the window threw every later layer's text, quads and images out of

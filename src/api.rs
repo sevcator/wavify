@@ -1,5 +1,5 @@
 use crate::config::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -9,7 +9,14 @@ use std::time::Duration;
 pub fn build_http(settings: &Settings) -> Result<reqwest::Client> {
     static CLIENT: std::sync::Mutex<Option<(String, reqwest::Client)>> =
         std::sync::Mutex::new(None);
-    let proxy = settings.proxy.clone().unwrap_or_default();
+    let configured_proxy = settings.proxy.as_deref().unwrap_or_default();
+    let proxy = if !configured_proxy.is_empty()
+        && crate::proxy_pool::configured_proxy_is_verified(configured_proxy)
+    {
+        configured_proxy.to_string()
+    } else {
+        String::new()
+    };
     if let Ok(guard) = CLIENT.lock() {
         if let Some((_, client)) = guard.as_ref().filter(|(key, _)| *key == proxy) {
             return Ok(client.clone());
@@ -204,18 +211,26 @@ impl Track {
             })
     }
 
-    pub fn display_artist_and_title(&self, prefer_from_name: bool) -> (String, String) {
+    pub fn display_artist_and_title(&self, prefer_from_metadata: bool) -> (String, String) {
         let uploader = self
             .user
             .as_ref()
             .map(|u| u.username.as_str())
             .unwrap_or("");
-        let permalink = self
-            .user
-            .as_ref()
-            .and_then(|u| u.permalink.as_deref())
-            .unwrap_or("");
-        parse_artist_and_title(&self.title, uploader, permalink, prefer_from_name)
+        let artist = if prefer_from_metadata {
+            self.publisher_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.artist.as_deref())
+                .map(str::trim)
+                .filter(|artist| !artist.is_empty())
+                .unwrap_or_else(|| uploader.trim())
+        } else {
+            uploader.trim()
+        };
+        (
+            if artist.is_empty() { "Unknown" } else { artist }.to_string(),
+            self.title.trim().to_string(),
+        )
     }
 }
 
@@ -490,6 +505,32 @@ impl LikeItem {
     }
 }
 
+fn parse_user_reposts_page(value: serde_json::Value) -> ApiList<Track> {
+    let mut seen = std::collections::HashSet::new();
+    let collection = value
+        .get("collection")
+        .and_then(|items| items.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let track = item
+                .get("track")
+                .or_else(|| item.get("playlist").is_none().then_some(item))?;
+            serde_json::from_value::<Track>(track.clone()).ok()
+        })
+        .filter(|track| track.id != 0 && !track.title.is_empty() && seen.insert(track.id))
+        .collect();
+    let next_href = value
+        .get("next_href")
+        .and_then(|href| href.as_str())
+        .filter(|href| !href.is_empty())
+        .map(str::to_string);
+    ApiList {
+        collection,
+        next_href,
+    }
+}
+
 pub struct Api {
     http: reqwest::Client,
     pub base_v2: String,
@@ -574,6 +615,7 @@ impl Api {
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T> {
+        crate::console::http_request("GET", url, None);
         let mut req = self
             .http
             .get(url)
@@ -587,19 +629,22 @@ impl Api {
             req = req.header("Cookie", ck);
         }
         let resp = req.send().await?;
-        crate::dlog!("HTTP GET {url} -> {}", resp.status());
-        if !resp.status().is_success() {
-            let st = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let response_url = resp.url().to_string();
+        let bytes = resp.bytes().await?;
+        crate::console::http_response("GET", &response_url, status, &bytes);
+        crate::dlog!("HTTP GET {} -> {status}", crate::console::redact(url));
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes);
             crate::dlog!("  body: {}", body.chars().take(600).collect::<String>());
             anyhow::bail!(
                 "HTTP {} for {} — {}",
-                st,
+                status,
                 url,
                 body.chars().take(180).collect::<String>()
             );
         }
-        match resp.json().await {
+        match serde_json::from_slice(&bytes) {
             Ok(v) => Ok(v),
             Err(e) => {
                 crate::log!("json decode FAILED for {}: {e}", &url[..url.len().min(120)]);
@@ -694,6 +739,55 @@ impl Api {
         Ok(vec![])
     }
 
+    /// One page of a user's liked tracks, preserving the server cursor for
+    /// demand-driven pagination in profile views.
+    pub async fn user_liked_tracks_page(
+        &self,
+        user_id: i64,
+        cid: &str,
+        limit: usize,
+    ) -> Result<ApiList<Track>> {
+        let u = self.v2_url(
+            &format!("/users/{user_id}/likes?limit={limit}&linked_partitioning=1"),
+            cid,
+        );
+        let page: ApiList<LikeItem> = self.get_json(&u).await?;
+        Ok(ApiList {
+            collection: page
+                .collection
+                .into_iter()
+                .filter_map(|item| item.into_track())
+                .filter(|track| track.id != 0)
+                .collect(),
+            next_href: page.next_href.filter(|href| !href.is_empty()),
+        })
+    }
+
+    pub async fn user_liked_tracks_next(
+        &self,
+        next_href: &str,
+        cid: &str,
+    ) -> Result<ApiList<Track>> {
+        let url = if next_href.contains("client_id=") {
+            next_href.to_string()
+        } else {
+            format!(
+                "{next_href}{}client_id={cid}",
+                if next_href.contains('?') { '&' } else { '?' }
+            )
+        };
+        let page: ApiList<LikeItem> = self.get_json(&url).await?;
+        Ok(ApiList {
+            collection: page
+                .collection
+                .into_iter()
+                .filter_map(|item| item.into_track())
+                .filter(|track| track.id != 0)
+                .collect(),
+            next_href: page.next_href.filter(|href| !href.is_empty()),
+        })
+    }
+
     /// Hydrate stub track objects (id-only) returned by mixed-selections.
     pub async fn tracks_by_ids(&self, ids: &[i64], cid: &str) -> Result<Vec<Track>> {
         if ids.is_empty() {
@@ -776,20 +870,26 @@ impl Api {
     }
 
     async fn get_mobile_json(&self, access: &str, path: &str) -> Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_mobile, path);
+        crate::console::http_request("GET", &url, None);
         let resp = self
             .http
-            .get(format!("{}{}", self.base_mobile, path))
+            .get(&url)
             .header("Authorization", format!("OAuth {access}"))
             .header("Accept", "application/json; charset=utf-8")
             .header("User-Agent", USER_AGENT)
             .header("App-Version", APP_VERSION)
             .send()
             .await?;
-        crate::dlog!("HTTP GET mobile {path} -> {}", resp.status());
-        if !resp.status().is_success() {
-            anyhow::bail!("HTTP {} for {}", resp.status(), path);
+        let status = resp.status();
+        let response_url = resp.url().to_string();
+        let bytes = resp.bytes().await?;
+        crate::console::http_response("GET", &response_url, status, &bytes);
+        crate::dlog!("HTTP GET mobile {path} -> {status}");
+        if !status.is_success() {
+            anyhow::bail!("HTTP {status} for {path}");
         }
-        Ok(resp.json().await?)
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     /// Artist shortcuts strip (SoundCloud stories): the followed artists that
@@ -830,12 +930,14 @@ impl Api {
                 "last_update_read": last_update_read,
             }]
         });
+        let url = format!(
+            "{}/users/{user_urn}/updates/read_receipts",
+            self.base_mobile
+        );
+        crate::console::http_request("POST", &url, Some(&body));
         let resp = self
             .http
-            .post(format!(
-                "{}/users/{user_urn}/updates/read_receipts",
-                self.base_mobile
-            ))
+            .post(&url)
             .header("Authorization", format!("OAuth {access}"))
             .header("Accept", "application/json; charset=utf-8")
             .header("Content-Type", "application/json; charset=utf-8")
@@ -844,10 +946,41 @@ impl Api {
             .json(&body)
             .send()
             .await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("HTTP {} for read_receipts", resp.status());
+        let status = resp.status();
+        let response_url = resp.url().to_string();
+        let response_body = resp.bytes().await?;
+        crate::console::http_response("POST", &response_url, status, &response_body);
+        if !status.is_success() {
+            anyhow::bail!("HTTP {status} for read_receipts");
         }
         Ok(())
+    }
+
+    /// Send one play marker using the Android client's `ApiRecentlyPlayed`
+    /// format and `/recently-played/contexts/v2` endpoint.
+    pub async fn record_listening_history(
+        &self,
+        access: &str,
+        track_id: i64,
+        played_at_ms: u64,
+    ) -> Result<()> {
+        if track_id <= 0 {
+            anyhow::bail!("invalid track id for listening history: {track_id}");
+        }
+        let body = serde_json::json!({
+            "collection": [{
+                "played_at": played_at_ms,
+                "urn": format!("soundcloud:tracks:{track_id}"),
+            }]
+        });
+        self.mobile_write_ok(
+            "listening history",
+            reqwest::Method::POST,
+            access,
+            "/recently-played/contexts/v2",
+            Some(body),
+        )
+        .await
     }
 
     /// Whether the mobile API takes this token (true for the login window's,
@@ -876,16 +1009,22 @@ impl Api {
 
     pub async fn me(&self, access: &str) -> Result<Me> {
         // temporary override for this call
+        let mobile_url = format!("{}/me?treating=1", self.base_mobile);
+        crate::console::http_request("GET", &mobile_url, None);
         let req = self
             .http
-            .get(format!("{}/me?treating=1", self.base_mobile))
+            .get(&mobile_url)
             .header("Authorization", format!("OAuth {access}"))
             .header("Accept", "application/json; charset=utf-8")
             .header("User-Agent", USER_AGENT)
             .header("App-Version", APP_VERSION);
         let resp = req.send().await?;
-        if resp.status().is_success() {
-            let v: serde_json::Value = resp.json().await?;
+        let status = resp.status();
+        let response_url = resp.url().to_string();
+        let response_body = resp.bytes().await?;
+        crate::console::http_response("GET", &response_url, status, &response_body);
+        if status.is_success() {
+            let v: serde_json::Value = serde_json::from_slice(&response_body)?;
             if let Some(user) = v.get("user") {
                 return Ok(serde_json::from_value(user.clone())?);
             }
@@ -896,16 +1035,22 @@ impl Api {
             "{}/me?client_id={}&app_version={}",
             self.base_v2, CLIENT_ID, APP_VERSION
         );
-        let v: serde_json::Value = self
+        crate::console::http_request("GET", &u, None);
+        let response = self
             .http
             .get(&u)
             .header("Authorization", format!("OAuth {access}"))
             .header("Accept", "application/json")
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let status = response.status();
+        let response_url = response.url().to_string();
+        let response_body = response.bytes().await?;
+        crate::console::http_response("GET", &response_url, status, &response_body);
+        if !status.is_success() {
+            anyhow::bail!("HTTP {status} for /me");
+        }
+        let v: serde_json::Value = serde_json::from_slice(&response_body)?;
         Ok(serde_json::from_value(v)?)
     }
 
@@ -975,9 +1120,11 @@ impl Api {
                 BROWSER_CHECK,
             ));
         }
+        let url = format!("{}{}", self.base_mobile, path);
+        crate::console::http_request(method.as_str(), &url, body);
         let mut req = self
             .http
-            .request(method, format!("{}{}", self.base_mobile, path))
+            .request(method.clone(), &url)
             .header("Authorization", format!("OAuth {access}"))
             .header("Accept", "application/json; charset=utf-8")
             .header("User-Agent", USER_AGENT)
@@ -991,12 +1138,16 @@ impl Api {
             String::new()
         };
         let resp = req.send().await?;
-        crate::dlog!("HTTP {method_name} mobile {path} -> {}", resp.status());
-        if resp.status() != reqwest::StatusCode::FORBIDDEN {
-            return Ok(resp);
-        }
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let response_url = resp.url().to_string();
+        let response_headers = resp.headers().clone();
+        let response_body = resp.bytes().await?;
+        crate::console::http_response(method_name.as_str(), &response_url, status, &response_body);
+        crate::dlog!("HTTP {method_name} mobile {path} -> {status}");
+        let body = String::from_utf8_lossy(&response_body).into_owned();
+        if status != reqwest::StatusCode::FORBIDDEN {
+            return response_with_body(status, response_headers, body);
+        }
         if self.try_check(&body).await {
             return Ok(refused_response(status, CHECK_PASSED));
         }
@@ -1038,23 +1189,28 @@ impl Api {
         query: &str,
         variables: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        let payload = serde_json::json!({ "query": query, "variables": variables });
+        crate::console::http_request("POST", GRAPH_API, Some(&payload));
         let mut req = self
             .http
             .post(GRAPH_API)
             .header("Accept", "application/json; charset=utf-8")
             .header("User-Agent", USER_AGENT)
             .header("App-Version", APP_VERSION)
-            .json(&serde_json::json!({ "query": query, "variables": variables }));
+            .json(&payload);
         if let Some(tok) = access.filter(|t| !t.is_empty()) {
             req = req.header("Authorization", format!("OAuth {tok}"));
         }
         let resp = req.send().await?;
         let st = resp.status();
+        let response_url = resp.url().to_string();
+        let bytes = resp.bytes().await?;
+        crate::console::http_response("POST", &response_url, st, &bytes);
         crate::dlog!(
             "HTTP POST graphql {} -> {st}",
             query.split(['(', '{']).next().unwrap_or("").trim()
         );
-        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         if let Some(err) = v.get("errors").and_then(|e| e.get(0)) {
             crate::dlog!("  graphql error: {err}");
             let msg = err
@@ -1175,18 +1331,39 @@ impl Api {
                 BROWSER_CHECK,
             ));
         }
-        let resp = self.browser_headers(build_req()).send().await?;
-        crate::dlog!("HTTP web write {} -> {}", resp.url(), resp.status());
+        let request = self.browser_headers(build_req());
+        let request_parts = request.try_clone().and_then(|request| request.build().ok());
+        if let Some(request) = request_parts.as_ref() {
+            crate::console::http_request_raw(
+                request.method().as_str(),
+                request.url().as_str(),
+                request.body().and_then(reqwest::Body::as_bytes),
+            );
+        }
+        let method = request_parts
+            .as_ref()
+            .map(|request| request.method().to_string())
+            .unwrap_or_else(|| "?".into());
+        let resp = request.send().await?;
+        let response_url = resp.url().to_string();
+        let response_headers = resp.headers().clone();
+        crate::dlog!(
+            "HTTP web write {} -> {}",
+            crate::console::redact(&response_url),
+            resp.status()
+        );
         self.handle_resp_cookie(&resp);
-        if resp.status() != reqwest::StatusCode::FORBIDDEN {
-            return Ok(resp);
+        let status = resp.status();
+        let response_body = resp.bytes().await?;
+        crate::console::http_response(&method, &response_url, status, &response_body);
+        let body = String::from_utf8_lossy(&response_body).into_owned();
+        if status != reqwest::StatusCode::FORBIDDEN {
+            return response_with_body(status, response_headers, body);
         }
         // Refused: DataDome wants a browser check (or blocks the network).
         // Resending doesn't help, and neither does solving the captcha in a
         // window (DataDome ties the pass to the browser that solved it; seen
         // in a debug log). Saves hold off for a while instead (captcha.rs).
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
         crate::dlog!("  refused: {}", body.chars().take(600).collect::<String>());
         if self.try_check(&body).await {
             return Ok(refused_response(status, CHECK_PASSED));
@@ -1450,6 +1627,7 @@ impl Api {
         let mut out = std::collections::HashSet::new();
         let mut next: Option<String> = Some(u);
         while let Some(curl) = next.take() {
+            crate::console::http_request("GET", &curl, None);
             let r = match self
                 .http
                 .get(&curl)
@@ -1458,10 +1636,20 @@ impl Api {
                 .send()
                 .await
             {
-                Ok(r) if r.status().is_success() => r,
+                Ok(r) => r,
                 _ => break,
             };
-            let v: serde_json::Value = match r.json().await {
+            let status = r.status();
+            let response_url = r.url().to_string();
+            let bytes = match r.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) => break,
+            };
+            crate::console::http_response("GET", &response_url, status, &bytes);
+            if !status.is_success() {
+                break;
+            }
+            let v: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(_) => break,
             };
@@ -1498,6 +1686,7 @@ impl Api {
             "{V2_API}/me/system_playlist_likes/urns?limit=200&client_id={CLIENT_ID}"
         ));
         while let Some(url) = next.take() {
+            crate::console::http_request("GET", &url, None);
             let Ok(resp) = self
                 .http
                 .get(&url)
@@ -1508,10 +1697,16 @@ impl Api {
             else {
                 break;
             };
-            if !resp.status().is_success() {
+            let status = resp.status();
+            let response_url = resp.url().to_string();
+            let Ok(bytes) = resp.bytes().await else {
+                break;
+            };
+            crate::console::http_response("GET", &response_url, status, &bytes);
+            if !status.is_success() {
                 break;
             }
-            let Ok(v) = resp.json::<serde_json::Value>().await else {
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                 break;
             };
             for x in v
@@ -1579,6 +1774,7 @@ impl Api {
         let mut out = std::collections::HashSet::new();
         let mut next: Option<String> = Some(u);
         while let Some(curl) = next.take() {
+            crate::console::http_request("GET", &curl, None);
             let resp = match self
                 .http
                 .get(&curl)
@@ -1587,10 +1783,20 @@ impl Api {
                 .send()
                 .await
             {
-                Ok(r) if r.status().is_success() => r,
+                Ok(r) => r,
                 _ => break,
             };
-            let v: serde_json::Value = match resp.json().await {
+            let status = resp.status();
+            let response_url = resp.url().to_string();
+            let bytes = match resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) => break,
+            };
+            crate::console::http_response("GET", &response_url, status, &bytes);
+            if !status.is_success() {
+                break;
+            }
+            let v: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(_) => break,
             };
@@ -1627,60 +1833,118 @@ impl Api {
         body_text: &str,
         track_time_ms: u64,
     ) -> Result<Comment> {
+        // Follow the Android client first. Its mobile route avoids the public
+        // API's CORS/DataDome path and accepts the same JSON comment body.
+        let payload = serde_json::json!({
+            "comment": {
+                "body": body_text,
+                "timestamp": track_time_ms,
+            }
+        });
+        let mut failures = Vec::new();
+        let mobile_path = format!("/tracks/{track_id}/comments");
+        match self
+            .mobile_write(reqwest::Method::POST, access, &mobile_path, Some(&payload))
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let response_body = resp.bytes().await?;
+                if status.is_success() {
+                    let value: serde_json::Value = serde_json::from_slice(&response_body)?;
+                    return Ok(comment_from_json(&value));
+                }
+                let body = String::from_utf8_lossy(&response_body).into_owned();
+                if status == reqwest::StatusCode::BAD_REQUEST {
+                    anyhow::bail!(
+                        "comment failed: HTTP {status} {}",
+                        body.chars().take(220).collect::<String>()
+                    );
+                }
+                if body.contains(CHECK_PASSED) {
+                    crate::log!("SoundCloud's check passed for comment: retrying mobile API once");
+                    match self
+                        .mobile_write(reqwest::Method::POST, access, &mobile_path, Some(&payload))
+                        .await
+                    {
+                        Ok(retry) => {
+                            let retry_status = retry.status();
+                            let retry_body = retry.bytes().await?;
+                            if retry_status.is_success() {
+                                let value: serde_json::Value = serde_json::from_slice(&retry_body)?;
+                                return Ok(comment_from_json(&value));
+                            }
+                            failures.push(format!(
+                                "mobile API retry HTTP {retry_status}: {}",
+                                String::from_utf8_lossy(&retry_body)
+                                    .chars()
+                                    .take(160)
+                                    .collect::<String>()
+                            ));
+                        }
+                        Err(e) => failures.push(format!("mobile API retry: {e}")),
+                    }
+                } else {
+                    failures.push(format!(
+                        "mobile API HTTP {status}: {}",
+                        body.chars().take(160).collect::<String>()
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("mobile API request: {e}")),
+        }
+
+        // If the mobile route is refused, try the web app's v2 form endpoint
+        // inside WebView2 (same API family the SoundCloud site uses).
         if let Some(bridge) = &self.bridge {
             match bridge
                 .post_comment(access, track_id, body_text, track_time_ms)
                 .await
             {
                 Ok(comment) => return Ok(comment),
-                Err(e) => crate::log!("bridge post_comment failed: {e}; trying http fallback"),
+                Err(e) => {
+                    failures.push(format!("browser bridge: {e}"));
+                    crate::log!("bridge post_comment failed: {e}; trying v2 form API");
+                }
             }
         }
-        let mobile_body = serde_json::json!({
-            "body": body_text,
-            "track_time": track_time_ms,
-        });
-        // the Android app: POST /tracks/{urn}/comments on the mobile API
-        let path = format!("/tracks/soundcloud:tracks:{track_id}/comments");
-        match self
-            .mobile_write(reqwest::Method::POST, access, &path, Some(&mobile_body))
-            .await
-        {
-            Ok(r) if r.status().is_success() => {
-                let v: serde_json::Value = r.json().await.unwrap_or_default();
-                return Ok(comment_from_json(&v));
-            }
-            Ok(r) => crate::log!("comment via mobile api: HTTP {}; trying v2", r.status()),
-            Err(e) => crate::log!("comment via mobile api: {e}; trying v2"),
-        }
-        let body_json = serde_json::json!({
-            "body": body_text,
-            "timestamp": track_time_ms,
-        });
-        let url = format!("{V2_API}/tracks/{track_id}/comments?client_id={CLIENT_ID}");
-        let resp = self
+
+        // The v2 form parser expects bracketed fields, not the nested JSON
+        // accepted by the mobile and public API routes.
+        let v2_url = format!("{V2_API}/tracks/{track_id}/comments?client_id={CLIENT_ID}");
+        let timestamp = track_time_ms.to_string();
+        let form_fields = [
+            ("comment[body]", body_text),
+            ("comment[timestamp]", timestamp.as_str()),
+        ];
+        let legacy = self
             .send_browser_write(|| {
                 self.http
-                    .post(&url)
+                    .post(&v2_url)
                     .header("Authorization", format!("OAuth {access}"))
-                    .header("Content-Type", "application/json; charset=utf-8")
-                    .json(&body_json)
+                    .form(&form_fields)
             })
-            .await?;
-        let st = resp.status();
-        if !st.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            if body.contains("captcha-delivery") {
-                anyhow::bail!("blocked by DataDome (status {st})");
+            .await;
+        match legacy {
+            Ok(resp) => {
+                let status = resp.status();
+                let bytes = resp.bytes().await?;
+                if status.is_success() {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                    return Ok(comment_from_json(&value));
+                }
+                failures.push(format!(
+                    "v2 form API HTTP {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                ));
             }
-            anyhow::bail!(
-                "comment failed: HTTP {st} {}",
-                body.chars().take(220).collect::<String>()
-            );
+            Err(e) => failures.push(format!("v2 form API request: {e}")),
         }
-        let v: serde_json::Value = resp.json().await?;
-        let comment: Comment = serde_json::from_value(v).unwrap_or_default();
-        Ok(comment)
+
+        anyhow::bail!("comment failed after all routes: {}", failures.join("; "))
     }
 
     pub async fn delete_comment(&self, access: &str, comment_id: i64) -> Result<()> {
@@ -1725,10 +1989,20 @@ impl Api {
     /// The original station order is strictly preserved via HashMap lookup.
     /// The seed track is guaranteed to be at index 0.
     /// If the system station playlist is empty or missing, falls back to seed track + related tracks.
-    pub async fn station_for_track(&self, track_id: i64, cid: &str) -> Result<Vec<Track>> {
+    pub async fn station_for_track(
+        &self,
+        track_id: i64,
+        cid: &str,
+    ) -> Result<(Vec<Track>, Option<String>)> {
         let urn = format!("soundcloud:system-playlists:track-stations:{track_id}");
         let u = self.v2_url(&format!("/system-playlists/{urn}"), cid);
+        let mut artwork_url = None;
         if let Ok(v) = self.get_json::<serde_json::Value>(&u).await {
+            artwork_url = v
+                .get("artwork_url")
+                .and_then(serde_json::Value::as_str)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string);
             let raw_tracks = v
                 .get("tracks")
                 .and_then(|t| t.as_array())
@@ -1755,7 +2029,7 @@ impl Api {
                         } else if let Ok(seed) = self.track(track_id, cid).await {
                             ordered.insert(0, seed);
                         }
-                        return Ok(ordered);
+                        return Ok((ordered, artwork_url));
                     }
                 }
             }
@@ -1773,7 +2047,7 @@ impl Api {
             }
         }
         if !result.is_empty() {
-            Ok(result)
+            Ok((result, artwork_url))
         } else {
             anyhow::bail!("No station tracks found for track {}", track_id)
         }
@@ -1781,10 +2055,20 @@ impl Api {
 
     /// Artist radio station. Hydrates stub track IDs and preserves station order.
     /// Falls back to user top tracks and related artists if station playlist is unavailable.
-    pub async fn station_for_artist(&self, user_id: i64, cid: &str) -> Result<Vec<Track>> {
+    pub async fn station_for_artist(
+        &self,
+        user_id: i64,
+        cid: &str,
+    ) -> Result<(Vec<Track>, Option<String>)> {
         let urn = format!("soundcloud:system-playlists:artist-stations:{user_id}");
         let u = self.v2_url(&format!("/system-playlists/{urn}"), cid);
+        let mut artwork_url = None;
         if let Ok(v) = self.get_json::<serde_json::Value>(&u).await {
+            artwork_url = v
+                .get("artwork_url")
+                .and_then(serde_json::Value::as_str)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string);
             let raw_tracks = v
                 .get("tracks")
                 .and_then(|t| t.as_array())
@@ -1802,7 +2086,7 @@ impl Api {
                     let ordered: Vec<Track> =
                         ids.iter().filter_map(|id| map.get(id).cloned()).collect();
                     if !ordered.is_empty() {
-                        return Ok(ordered);
+                        return Ok((ordered, artwork_url));
                     }
                 }
             }
@@ -1830,20 +2114,33 @@ impl Api {
             }
         }
         if !result.is_empty() {
-            Ok(result)
+            Ok((result, artwork_url))
         } else {
             anyhow::bail!("No station tracks found for artist {}", user_id)
         }
     }
 
-    /// Top tracks — web form: /users/{id}/toptracks
+    /// Top tracks — web form first, then the mobile client's route if needed.
     pub async fn user_top_tracks(&self, user_id: i64, cid: &str) -> Result<Vec<Track>> {
         let u = self.v2_url(
             &format!("/users/{user_id}/toptracks?limit=10&offset=0&linked_partitioning=1"),
             cid,
         );
-        let list: ApiList<Track> = self.get_json(&u).await?;
-        Ok(list.collection)
+        match self.get_json::<ApiList<Track>>(&u).await {
+            Ok(list) => Ok(list.collection),
+            Err(web_error) => {
+                let Some(access) = self.access.as_deref() else {
+                    return Err(web_error);
+                };
+                let value = self
+                    .get_mobile_json(access, &format!("/users/{user_id}/top-tracks"))
+                    .await
+                    .with_context(|| format!("web top-tracks request failed: {web_error}"))?;
+                let list: ApiList<Track> = serde_json::from_value(value)
+                    .context("mobile top-tracks response had an unexpected shape")?;
+                Ok(list.collection)
+            }
+        }
     }
 
     /// All posted tracks for a profile (long pagination).
@@ -2023,25 +2320,102 @@ impl Api {
 
     /// Tracks a user reposted — /users/{id}/reposts (wrappers {track}).
     pub async fn user_reposts(&self, user_id: i64, cid: &str) -> Result<Vec<Track>> {
-        let u = self.v2_url(
-            &format!("/stream/users/{user_id}/reposts?limit=40&linked_partitioning=1"),
+        Ok(self.user_reposts_page(user_id, cid, 40).await?.collection)
+    }
+
+    /// One page of reposted tracks plus SoundCloud's cursor for the next page.
+    pub async fn user_reposts_page(
+        &self,
+        user_id: i64,
+        cid: &str,
+        limit: usize,
+    ) -> Result<ApiList<Track>> {
+        let url = self.v2_url(
+            &format!("/stream/users/{user_id}/reposts?limit={limit}&linked_partitioning=1"),
             cid,
         );
-        let v: serde_json::Value = self.get_json(&u).await?;
-        let mut out = Vec::new();
-        if let Some(col) = v.get("collection").and_then(|c| c.as_array()) {
-            for item in col {
-                let t = item.get("track").cloned().or_else(|| Some(item.clone()));
-                if let Some(t) = t {
-                    if let Ok(tr) = serde_json::from_value::<Track>(t) {
-                        if tr.id != 0 && !tr.title.is_empty() {
-                            out.push(tr);
+        let value: serde_json::Value = self.get_json(&url).await?;
+        Ok(parse_user_reposts_page(value))
+    }
+
+    pub async fn user_reposts_next(&self, next_href: &str, cid: &str) -> Result<ApiList<Track>> {
+        let url = if next_href.contains("client_id=") {
+            next_href.to_string()
+        } else {
+            format!(
+                "{next_href}{}client_id={cid}",
+                if next_href.contains('?') { '&' } else { '?' }
+            )
+        };
+        let value: serde_json::Value = self.get_json(&url).await?;
+        Ok(parse_user_reposts_page(value))
+    }
+
+    /// Reposted tracks and playlists from one paginated stream request.
+    pub async fn user_repost_items(
+        &self,
+        user_id: i64,
+        cid: &str,
+    ) -> Result<(Vec<Track>, Vec<Playlist>)> {
+        let mut url = self.v2_url(
+            &format!("/stream/users/{user_id}/reposts?limit=200&linked_partitioning=1"),
+            cid,
+        );
+        let mut tracks = Vec::new();
+        let mut playlists = Vec::new();
+        let mut seen_tracks = std::collections::HashSet::new();
+        let mut seen_playlists = std::collections::HashSet::new();
+        for _ in 0..25 {
+            let v: serde_json::Value = self.get_json(&url).await?;
+            if let Some(col) = v.get("collection").and_then(|c| c.as_array()) {
+                for item in col {
+                    let track_value = item
+                        .get("track")
+                        .or_else(|| item.get("playlist").is_none().then_some(item));
+                    if let Some(t) = track_value {
+                        if let Ok(tr) = serde_json::from_value::<Track>(t.clone()) {
+                            if tr.id != 0 && !tr.title.is_empty() && seen_tracks.insert(tr.id) {
+                                tracks.push(tr);
+                            }
+                        }
+                    }
+                    if let Some(value) = item.get("playlist") {
+                        if let Ok(playlist) = serde_json::from_value::<Playlist>(value.clone()) {
+                            let key = playlist.id_or_urn();
+                            if !key.is_empty()
+                                && !playlist.title.is_empty()
+                                && seen_playlists.insert(key)
+                            {
+                                playlists.push(playlist);
+                            }
                         }
                     }
                 }
             }
+            let Some(next) = v
+                .get("next_href")
+                .and_then(|n| n.as_str())
+                .filter(|s| !s.is_empty())
+            else {
+                break;
+            };
+            url = if next.contains("client_id=") {
+                next.to_string()
+            } else {
+                format!(
+                    "{next}{}client_id={cid}",
+                    if next.contains('?') { '&' } else { '?' }
+                )
+            };
         }
-        Ok(out)
+        Ok((tracks, playlists))
+    }
+
+    /// Playlists reposted by a user. The stream endpoint mixes repostable
+    /// entity types in one collection; playlist reposts are wrapped as
+    /// `{ playlist: ... }` (some responses use `track` only).
+    pub async fn user_reposted_playlists(&self, user_id: i64, cid: &str) -> Result<Vec<Playlist>> {
+        Ok(self.user_repost_items(user_id, cid).await?.1)
     }
 
     /// Next page for a search (follows next_href).
@@ -2351,13 +2725,21 @@ impl Api {
     /// Fetch an HLS playlist and return its init segment (fMP4) plus every
     /// media chunk URL in order. For plain mp3 HLS playlists `init` is None.
     async fn resolve_hls(&self, m3u8_url: &str) -> Result<StreamSource> {
+        crate::console::http_request("GET", m3u8_url, None);
         let resp = self
             .http
             .get(m3u8_url)
             .header("Accept", "*/*")
             .send()
             .await?;
-        let body = resp.text().await?;
+        let status = resp.status();
+        let response_url = resp.url().to_string();
+        let bytes = resp.bytes().await?;
+        crate::console::http_response("GET", &response_url, status, &bytes);
+        if !status.is_success() {
+            anyhow::bail!("HLS playlist request failed: HTTP {status}");
+        }
+        let body = String::from_utf8_lossy(&bytes);
         let mut init: Option<String> = None;
         let mut chunks: Vec<String> = Vec::new();
         for line in body.lines() {
@@ -2769,6 +3151,18 @@ fn refused_response(status: reqwest::StatusCode, body: &str) -> reqwest::Respons
         .body(body.to_string())
         .map(reqwest::Response::from)
         .expect("a status and a text body")
+}
+
+/// Rebuild a consumed JSON write response so callers retain its status,
+/// headers and body after the debug logger has recorded the full payload.
+fn response_with_body(
+    status: reqwest::StatusCode,
+    headers: http::HeaderMap,
+    body: String,
+) -> Result<reqwest::Response> {
+    let mut response = http::Response::builder().status(status).body(body)?;
+    *response.headers_mut() = headers;
+    Ok(reqwest::Response::from(response))
 }
 
 /// "POST" / "DELETE" ... of a request about to go (for the debug log).

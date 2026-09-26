@@ -25,6 +25,17 @@ mod tests {
     }
 
     #[test]
+    fn settings_migrate_old_artist_preference_key() {
+        let settings: config::Settings =
+            serde_json::from_str(r#"{"prefer_artist_from_name":true}"#).unwrap();
+        assert!(settings.prefer_artist_from_metadata);
+
+        let saved = serde_json::to_value(settings).unwrap();
+        assert_eq!(saved["prefer_artist_from_metadata"], true);
+        assert!(saved.get("prefer_artist_from_name").is_none());
+    }
+
+    #[test]
     fn test_track_serialization_roundtrip() {
         let track = api::Track {
             id: 123456,
@@ -44,6 +55,42 @@ mod tests {
         assert_eq!(deserialized.title, "Test Track Title");
         assert_eq!(deserialized.duration, Some(180000));
         assert_eq!(deserialized.user.as_ref().unwrap().username, "Artist");
+    }
+
+    #[test]
+    fn test_artist_preference_uses_publisher_metadata_then_uploader() {
+        let track = api::Track {
+            title: "Track title - not an artist source".into(),
+            user: Some(api::UserMini {
+                username: "лоло".into(),
+                ..Default::default()
+            }),
+            publisher_metadata: Some(api::PublisherMetadata {
+                artist: Some("лоло, #ребенокискусства".into()),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            track.display_artist_and_title(true),
+            (
+                "лоло, #ребенокискусства".into(),
+                "Track title - not an artist source".into()
+            )
+        );
+        assert_eq!(
+            track.display_artist_and_title(false),
+            ("лоло".into(), "Track title - not an artist source".into())
+        );
+
+        let no_metadata = api::Track {
+            publisher_metadata: None,
+            ..track
+        };
+        assert_eq!(
+            no_metadata.display_artist_and_title(true),
+            ("лоло".into(), "Track title - not an artist source".into())
+        );
     }
 
     #[test]

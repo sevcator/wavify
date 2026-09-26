@@ -28,6 +28,12 @@ pub struct Settings {
     pub download_quality: Option<String>,
     #[serde(default)]
     pub hide_scrollbars: bool,
+    /// Width of the Your Library sidebar, in logical pixels.
+    #[serde(default = "default_library_width")]
+    pub library_width: f32,
+    /// Width of the Queue side panel, in logical pixels.
+    #[serde(default = "default_queue_width")]
+    pub queue_width: f32,
     #[serde(default)]
     pub offline_mode: bool,
     #[serde(default)]
@@ -35,8 +41,8 @@ pub struct Settings {
     /// Listening activity: the playing track on your Discord profile.
     #[serde(default = "default_true")]
     pub discord_rpc: bool,
-    #[serde(default)]
-    pub prefer_artist_from_name: bool,
+    #[serde(default, alias = "prefer_artist_from_name")]
+    pub prefer_artist_from_metadata: bool,
     /// Unlock through a proxy: tracks unavailable in this country play
     /// through public proxies from elsewhere.
     #[serde(default)]
@@ -48,8 +54,8 @@ pub struct Settings {
     /// Zoom level, 0.7 to 1.3.
     #[serde(default = "default_zoom")]
     pub zoom: f32,
-    /// Private session: until then (ms since the epoch) nothing shows what
-    /// you play, and nothing goes into your listening history.
+    /// Private session expiration in ms since the epoch. `u64::MAX` means
+    /// enabled until the user turns it off.
     #[serde(default)]
     pub private_until_ms: Option<u64>,
     /// Crossfade between tracks, seconds (0: off).
@@ -63,6 +69,15 @@ pub struct Settings {
     pub mono_audio: bool,
     #[serde(default)]
     pub equalizer: bool,
+    /// Hide comments throughout the app.
+    #[serde(default)]
+    pub disable_comments: bool,
+    /// Hide waveform and story reactions throughout the app.
+    #[serde(default)]
+    pub disable_reactions: bool,
+    /// Do not show the track artwork visual behind waveform bars.
+    #[serde(default)]
+    pub disable_wave_background: bool,
     /// Gains of the equalizer's six bands, dB.
     #[serde(default)]
     pub eq_gains: [f32; 6],
@@ -76,6 +91,9 @@ pub struct Settings {
     /// The window's close button minimizes it instead of quitting.
     #[serde(default)]
     pub close_minimizes: bool,
+    /// Hide the window to the Windows notification area on close.
+    #[serde(default)]
+    pub allow_system_tray: bool,
     #[serde(default)]
     pub compact_library: bool,
     /// Keep what's played on this computer: the audio, its cover and
@@ -89,6 +107,9 @@ pub struct Settings {
     /// Check the GitHub Releases feed on startup and from Settings.
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// Open a console and record detailed network diagnostics on next launch.
+    #[serde(default)]
+    pub debug_mode: bool,
     /// The release declined with "Remind me after new version" enabled.
     #[serde(default)]
     pub ignored_update_version: Option<String>,
@@ -143,6 +164,14 @@ fn default_zoom() -> f32 {
     1.0
 }
 
+fn default_library_width() -> f32 {
+    260.0
+}
+
+fn default_queue_width() -> f32 {
+    280.0
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -151,10 +180,12 @@ impl Default for Settings {
             audio_quality: None,
             download_quality: None,
             hide_scrollbars: false,
+            library_width: default_library_width(),
+            queue_width: default_queue_width(),
             offline_mode: false,
             volume: None,
             discord_rpc: true,
-            prefer_artist_from_name: false,
+            prefer_artist_from_metadata: false,
             bypass_unavailable: false,
             youtube_music: true,
             zoom: 1.0,
@@ -164,24 +195,30 @@ impl Default for Settings {
             volume_level: VolumeLevel::Normal,
             mono_audio: false,
             equalizer: false,
+            disable_comments: false,
+            disable_reactions: false,
+            disable_wave_background: false,
             eq_gains: [0.0; 6],
             autoplay: true,
             shuffle_style: ShuffleStyle::FewerRepeats,
             open_at_login: OpenAtLogin::No,
             close_minimizes: false,
+            allow_system_tray: false,
             compact_library: false,
             cache_tracks: false,
             artist_sort: ArtistSort::Tracks,
             check_updates: true,
+            debug_mode: false,
             ignored_update_version: None,
         }
     }
 }
 
 impl Settings {
-    /// A private session is on (it ends by itself after 6 hours).
+    /// Whether private listening is enabled.
     pub fn private_session(&self) -> bool {
-        self.private_until_ms.is_some_and(|t| now_ms() < t)
+        self.private_until_ms
+            .is_some_and(|until| until == u64::MAX || now_ms() < until)
     }
 }
 
@@ -476,11 +513,21 @@ pub fn save_settings(s: &Settings) {
 impl Settings {
     pub fn load() -> Settings {
         let p = config_dir().join("settings.json");
-        if let Ok(s) = std::fs::read_to_string(&p) {
+        let mut settings = if let Ok(s) = std::fs::read_to_string(&p) {
             serde_json::from_str(&s).unwrap_or_default()
         } else {
             Settings::default()
+        };
+
+        // Older releases stored a six-hour deadline. Preserve a still-active
+        // session as indefinite, but clear an already-expired one.
+        if let Some(until) = settings.private_until_ms {
+            if until != u64::MAX {
+                settings.private_until_ms = (until > now_ms()).then_some(u64::MAX);
+                settings.save();
+            }
         }
+        settings
     }
 
     pub fn save(&self) {

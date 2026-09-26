@@ -90,7 +90,7 @@ pub fn script() -> &'static str {
 pub fn handle(window: &str, msg: &str) -> bool {
     match msg.strip_prefix("__wavify_debug ") {
         Some(line) => {
-            crate::log!("[{window}] {line}");
+            crate::console::detail(&format!("WEBVIEW {window}"), line);
             true
         }
         None => false,
@@ -99,8 +99,12 @@ pub fn handle(window: &str, msg: &str) -> bool {
 
 /// A navigation the window allowed or stopped.
 pub fn navigation(window: &str, url: &str, allowed: bool) {
-    crate::dlog!(
-        "[{window}] navigate {url}{}",
-        if allowed { "" } else { " (stopped)" }
+    crate::console::detail(
+        &format!("WEBVIEW {window} NAVIGATION"),
+        &format!(
+            "{}{}",
+            crate::console::redact(url),
+            if allowed { "" } else { " (stopped)" }
+        ),
     );
 }

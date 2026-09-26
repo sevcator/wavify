@@ -39,6 +39,7 @@ pub struct BridgeRequest {
     pub url: String,
     pub method: String,
     pub body: Option<serde_json::Value>,
+    pub form: bool,
     pub access: Option<String>,
 }
 
@@ -149,19 +150,23 @@ pub fn run_bridge() -> ! {
                 this.execute(req);
             },
             async execute(req) {
-                const { id, url, method, body, access } = req;
+                const { id, url, method, body, form, access } = req;
                 const headers = { 'Accept': 'application/json' };
                 if (access) {
                     headers['Authorization'] = `OAuth ${access}`;
                 }
                 if (body !== null && body !== undefined) {
-                    headers['Content-Type'] = 'application/json';
+                    headers['Content-Type'] = form
+                        ? 'application/x-www-form-urlencoded; charset=UTF-8'
+                        : 'application/json';
                 }
                 try {
                     const resp = await fetch(url, {
                         method: method || 'GET',
                         headers,
-                        body: (body !== null && body !== undefined) ? JSON.stringify(body) : undefined,
+                        body: (body !== null && body !== undefined)
+                            ? (form ? new URLSearchParams(body).toString() : JSON.stringify(body))
+                            : undefined,
                         credentials: 'include'
                     });
                     const text = await resp.text();
@@ -484,7 +489,48 @@ impl ScBridge {
         body: Option<serde_json::Value>,
         access: Option<&str>,
     ) -> Result<BridgeResponse> {
-        let resp = self.request_once(url, method, body.clone(), access).await?;
+        self.request_encoded(url, method, body, false, access).await
+    }
+
+    /// A form-encoded write through the browser bridge. Some legacy
+    /// SoundCloud endpoints parse bracketed form fields but ignore JSON bodies.
+    pub async fn request_form(
+        self: &Arc<Self>,
+        url: &str,
+        method: &str,
+        fields: &[(&str, &str)],
+        access: Option<&str>,
+    ) -> Result<BridgeResponse> {
+        let body = fields
+            .iter()
+            .map(|(key, value)| {
+                (
+                    (*key).to_string(),
+                    serde_json::Value::String((*value).to_string()),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        self.request_encoded(
+            url,
+            method,
+            Some(serde_json::Value::Object(body)),
+            true,
+            access,
+        )
+        .await
+    }
+
+    async fn request_encoded(
+        self: &Arc<Self>,
+        url: &str,
+        method: &str,
+        body: Option<serde_json::Value>,
+        form: bool,
+        access: Option<&str>,
+    ) -> Result<BridgeResponse> {
+        let resp = self
+            .request_once(url, method, body.clone(), form, access)
+            .await?;
         if !resp.ok {
             // what a refused write got, for bridge.log (no tokens in it)
             let path = url.split('?').next().unwrap_or(url);
@@ -515,7 +561,7 @@ impl ScBridge {
         if !self.solve_check(&check).await {
             return Ok(resp);
         }
-        self.request_once(url, method, body, access).await
+        self.request_once(url, method, body, form, access).await
     }
 
     /// Show DataDome's check in the bridge's window and wait for it to be
@@ -564,6 +610,7 @@ impl ScBridge {
         url: &str,
         method: &str,
         body: Option<serde_json::Value>,
+        form: bool,
         access: Option<&str>,
     ) -> Result<BridgeResponse> {
         self.ensure_started();
@@ -574,8 +621,10 @@ impl ScBridge {
             url: url.to_string(),
             method: method.to_string(),
             body,
+            form,
             access: access.map(str::to_string),
         };
+        crate::console::http_request(&req.method, &req.url, req.body.as_ref());
 
         let json_line = serde_json::to_string(&req)?;
         let (tx, rx) = oneshot::channel();
@@ -605,7 +654,16 @@ impl ScBridge {
 
         // Wait with timeout
         match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(resp)) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "ok": resp.ok,
+                    "data": &resp.data,
+                    "error": &resp.error,
+                }))
+                .unwrap_or_default();
+                crate::console::http_response(method, url, resp.status, &body);
+                Ok(resp)
+            }
             Ok(Err(_)) => bail!("sc_bridge response channel closed"),
             Err(_) => {
                 let mut p = self.pending.lock().unwrap();
@@ -840,32 +898,19 @@ impl ScBridge {
         text: &str,
         track_time_ms: u64,
     ) -> Result<crate::api::Comment> {
-        let body = serde_json::json!({
-            "body": text,
-            "timestamp": track_time_ms
-        });
         let url = format!(
             "https://api-v2.soundcloud.com/tracks/{track_id}/comments?client_id={CLIENT_ID}"
         );
-        let resp = self.request(&url, "POST", Some(body), Some(access)).await?;
+        let timestamp = track_time_ms.to_string();
+        let fields = [
+            ("comment[body]", text),
+            ("comment[timestamp]", timestamp.as_str()),
+        ];
+        let resp = self
+            .request_form(&url, "POST", &fields, Some(access))
+            .await?;
         if resp.ok {
             if let Some(data) = resp.data {
-                let comment: crate::api::Comment = serde_json::from_value(data)?;
-                return Ok(comment);
-            }
-        }
-        // Fallback: try nested comment envelope if rejected
-        let body_nested = serde_json::json!({
-            "comment": {
-                "body": text,
-                "timestamp": track_time_ms
-            }
-        });
-        let resp2 = self
-            .request(&url, "POST", Some(body_nested), Some(access))
-            .await?;
-        if resp2.ok {
-            if let Some(data) = resp2.data {
                 let comment: crate::api::Comment = serde_json::from_value(data)?;
                 return Ok(comment);
             }

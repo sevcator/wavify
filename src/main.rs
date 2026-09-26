@@ -10,6 +10,8 @@ mod login_window;
 mod media_keys;
 mod player;
 mod selftest;
+#[cfg(windows)]
+mod system_tray;
 mod ui;
 mod updater;
 mod virtual_list;
@@ -20,10 +22,27 @@ mod yt_web;
 fn main() {
     console::attach();
     let args: Vec<String> = std::env::args().collect();
+    let settings = config::Settings::load();
+    let helper_process = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--selftest" | "--login" | "--yt-login" | "--yt-player" | "--sc-bridge"
+        )
+    });
+    let auth_callback = args
+        .get(1)
+        .is_some_and(|arg| auth::parse_code_from_arg(arg).is_some());
+    let persistent_debug = settings.debug_mode && !helper_process && !auth_callback;
+    if persistent_debug {
+        console::show();
+    }
 
     // --debug (or a parent in debug mode): this process logs to a file of
     // its own under <config>/debug, and its children do too
-    if args.iter().any(|a| a == "--debug") || std::env::var_os(console::DEBUG_ENV).is_some() {
+    if args.iter().any(|a| a == "--debug")
+        || std::env::var_os(console::DEBUG_ENV).is_some()
+        || persistent_debug
+    {
         let role = [
             ("--selftest", "selftest"),
             ("--login", "login"),
@@ -101,7 +120,6 @@ fn main() {
 
     let _ = config::register_sc_protocol();
 
-    let settings = config::Settings::load();
     // a proxy URL can hold a password: only whether there is one
     log!(
         "settings loaded (proxy={}, quality={:?})",

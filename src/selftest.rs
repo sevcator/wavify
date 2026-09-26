@@ -119,11 +119,11 @@ pub async fn run() -> Result<()> {
         Err(e) => crate::log!("[FAIL] comments: {e}"),
     }
     match api.station_for_track(2162751417, &cid).await {
-        Ok(v) => crate::log!("[PASS] track radio: {} tracks", v.len()),
+        Ok((tracks, _)) => crate::log!("[PASS] track radio: {} tracks", tracks.len()),
         Err(e) => crate::log!("[FAIL] track radio: {e}"),
     }
     match api.station_for_artist(3685019, &cid).await {
-        Ok(v) => crate::log!("[PASS] artist radio: {} tracks", v.len()),
+        Ok((tracks, _)) => crate::log!("[PASS] artist radio: {} tracks", tracks.len()),
         Err(e) => crate::log!("[FAIL] artist radio: {e}"),
     }
     match api.user_reposts(3685019, &cid).await {
@@ -423,7 +423,7 @@ pub async fn run() -> Result<()> {
 
     // 6. artist radio station
     match api.station_for_artist(3685019, &cid).await {
-        Ok(v) => crate::log!("[PASS] artist station: {} tracks", v.len()),
+        Ok((tracks, _)) => crate::log!("[PASS] artist station: {} tracks", tracks.len()),
         Err(e) => crate::log!("[FAIL] artist station: {e}"),
     }
 

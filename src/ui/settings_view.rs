@@ -22,6 +22,9 @@ pub enum Pref {
     VolumeLevel(VolumeLevel),
     MonoAudio(bool),
     Equalizer(bool),
+    DisableComments(bool),
+    DisableReactions(bool),
+    DisableWaveBackground(bool),
     /// A band dragged on the equalizer's graph (saved when let go).
     EqBand(usize, f32),
     EqPreset(usize),
@@ -29,12 +32,14 @@ pub enum Pref {
     ShuffleStyle(ShuffleStyle),
     OpenAtLogin(OpenAtLogin),
     CloseMinimizes(bool),
+    AllowSystemTray(bool),
     CompactLibrary(bool),
     StreamQuality(StreamQuality),
     DownloadQuality(DownloadQuality),
     CacheTracks(bool),
     ArtistSort(ArtistSort),
     CheckUpdates(bool),
+    DebugMode(bool),
 }
 
 /// The zoom levels, Spotify's seven.
@@ -260,12 +265,11 @@ impl App {
                 task = self.bake_wave_visual();
             }
             Pref::PrivateSession(on) => {
-                self.settings.private_until_ms =
-                    on.then(|| crate::config::now_ms() + 6 * 60 * 60 * 1000);
+                self.settings.private_until_ms = on.then_some(u64::MAX);
                 self.update_discord_rpc();
                 self.show_toast(
                     if on {
-                        "Private session: on for 6 hours"
+                        "Private session enabled"
                     } else {
                         "Private session ended"
                     },
@@ -289,9 +293,76 @@ impl App {
                 self.settings.equalizer = on;
                 self.apply_audio_prefs();
             }
+            Pref::DisableComments(on) => {
+                self.settings.disable_comments = on;
+                if on {
+                    self.wave_comments.clear();
+                    self.comments_next = None;
+                    self.comments_loading = false;
+                    self.wave_context_frac = None;
+                    self.wave_context_track = None;
+                } else {
+                    let mut reloads = Vec::new();
+                    if let Some(track_id) = self.playing_id.filter(|id| {
+                        !self.settings.offline_mode
+                            || crate::config::cached_comments_path(*id).exists()
+                    }) {
+                        self.comments_loading = true;
+                        reloads.push(Task::perform(
+                            fetch_comments(track_id, self.settings.offline_mode),
+                            |r| Message::CommentsLoaded(r.map_err(|e| e.to_string())),
+                        ));
+                    }
+                    if let Some(track_id) = self.track_page.as_ref().map(|page| page.track.id) {
+                        reloads.push(Task::perform(
+                            fetch_inspector_comments(track_id),
+                            |r| match r {
+                                Ok(comments) => Message::TrackPageCommentsLoaded(Ok(comments)),
+                                Err(e) => Message::TrackPageCommentsLoaded(Err(e.to_string())),
+                            },
+                        ));
+                    }
+                    if let Some(track_id) = self.inspector_track.as_ref().map(|track| track.id) {
+                        self.inspector_tasks_pending += 1;
+                        reloads.push(Task::perform(
+                            fetch_inspector_comments(track_id),
+                            move |r| {
+                                Message::InspectorCommentsLoaded(
+                                    track_id,
+                                    r.map(|(_, comments)| comments).map_err(|e| e.to_string()),
+                                )
+                            },
+                        ));
+                    }
+                    task = Task::batch(reloads);
+                }
+            }
+            Pref::DisableReactions(on) => {
+                self.settings.disable_reactions = on;
+                if on {
+                    self.reactions.clear();
+                    self.reactions_fetched.clear();
+                    self.floating.clear();
+                    self.particles.clear();
+                    self.wave_context_frac = None;
+                    self.wave_context_track = None;
+                }
+            }
+            Pref::DisableWaveBackground(on) => {
+                self.settings.disable_wave_background = on;
+                if on {
+                    self.wave_visual = None;
+                    self.wave_visual_src = None;
+                    self.wave_visual_baking = false;
+                } else if let Some(track) =
+                    self.playing_id.and_then(|id| self.find_track_anywhere(id))
+                {
+                    task = self.load_wave_visual(&track);
+                }
+            }
             Pref::EqBand(band, db) => {
                 if let Some(g) = self.settings.eq_gains.get_mut(band) {
-                    *g = (db * 2.0).round() / 2.0;
+                    *g = db.clamp(-EQ_RANGE_DB, EQ_RANGE_DB);
                 }
                 self.apply_audio_prefs();
                 save = false;
@@ -313,6 +384,34 @@ impl App {
                 }
             },
             Pref::CloseMinimizes(on) => self.settings.close_minimizes = on,
+            Pref::AllowSystemTray(on) => {
+                #[cfg(windows)]
+                {
+                    if on {
+                        match crate::system_tray::TrayController::start() {
+                            Ok(tray) => {
+                                self.system_tray = Some(tray);
+                                self.settings.allow_system_tray = true;
+                            }
+                            Err(e) => {
+                                self.show_toast(
+                                    format!("Couldn't enable system tray: {e}"),
+                                    ToastKind::Error,
+                                );
+                                save = false;
+                            }
+                        }
+                    } else {
+                        self.system_tray = None;
+                        self.settings.allow_system_tray = false;
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    self.settings.allow_system_tray = false;
+                    save = false;
+                }
+            }
             Pref::CompactLibrary(on) => self.settings.compact_library = on,
             Pref::StreamQuality(q) => {
                 self.settings.audio_quality = match q {
@@ -336,6 +435,17 @@ impl App {
                 sort_followings(&mut self.my_followings, sort);
             }
             Pref::CheckUpdates(on) => self.settings.check_updates = on,
+            Pref::DebugMode(on) => {
+                self.settings.debug_mode = on;
+                self.show_toast(
+                    if on {
+                        "Debug mode will start on the next launch"
+                    } else {
+                        "Debug mode disabled for the next launch"
+                    },
+                    ToastKind::Info,
+                );
+            }
             Pref::DownloadQuality(q) => {
                 self.settings.download_quality = match q {
                     DownloadQuality::High => None,
@@ -495,17 +605,17 @@ impl App {
                     self.zoom_panel(),
                 ),
                 settings_row(
-                    "display artist from track name title uploader".into(),
+                    "display prefer artists from metadata uploader".into(),
                     settings_label(
-                        "Artist from the track name",
+                        "Prefer Artists from metadata",
                         Some(
-                            "For names written 'Artist - Title', show the artist from the name \
-                             instead of the uploader.",
+                            "Use the artist credited in SoundCloud track metadata instead of \
+                             the uploader's display name. Falls back to the uploader when missing.",
                         ),
                     ),
                     settings_switch(
-                        s.prefer_artist_from_name,
-                        Message::SettingsPreferArtistFromName(!s.prefer_artist_from_name),
+                        s.prefer_artist_from_metadata,
+                        Message::SettingsPreferArtistFromMetadata(!s.prefer_artist_from_metadata),
                     ),
                 ),
                 settings_row(
@@ -522,16 +632,8 @@ impl App {
 
         // --- Listening activity and insights
         let private = s.private_session();
-        let private_desc = match s.private_until_ms.filter(|_| private) {
-            Some(until) => format!(
-                "Hides what you play from Discord and keeps it out of your listening \
-                 history. Ends in {}.",
-                time_left(until)
-            ),
-            None => "Temporarily hides your listening activity and keeps it out of your \
-                     listening history. Ends after 6 hours."
-                .to_string(),
-        };
+        let private_desc =
+            "Hides what you play from Discord and keeps it out of your listening history.";
         let discord_desc = if !s.discord_rpc {
             "Your Discord profile shows the track you're playing."
         } else if crate::discord_rpc::is_connected() {
@@ -544,7 +646,7 @@ impl App {
             vec![
                 settings_row(
                     format!("listening activity private session hide {private_desc}"),
-                    settings_label("Private session", Some(&private_desc)),
+                    settings_label("Private session", Some(private_desc)),
                     settings_switch(private, Message::SetPref(Pref::PrivateSession(!private))),
                 ),
                 settings_row(
@@ -668,6 +770,28 @@ impl App {
             ),
         ));
         playback.push(settings_row(
+            "playback comments disable hide".into(),
+            settings_label(
+                "Disable comments",
+                Some("Hide comments and comment controls."),
+            ),
+            settings_switch(
+                s.disable_comments,
+                Message::SetPref(Pref::DisableComments(!s.disable_comments)),
+            ),
+        ));
+        playback.push(settings_row(
+            "playback reactions disable hide".into(),
+            settings_label(
+                "Disable reactions",
+                Some("Hide reactions and reaction controls."),
+            ),
+            settings_switch(
+                s.disable_reactions,
+                Message::SetPref(Pref::DisableReactions(!s.disable_reactions)),
+            ),
+        ));
+        playback.push(settings_row(
             "playback equalizer eq bass treble presets".into(),
             settings_label("Equalizer", None),
             settings_switch(s.equalizer, Message::SetPref(Pref::Equalizer(!s.equalizer))),
@@ -675,6 +799,17 @@ impl App {
         playback.push(settings_block(
             "playback equalizer eq bass treble presets graph",
             self.eq_panel(),
+        ));
+        playback.push(settings_row(
+            "playback waveform background visual disable".into(),
+            settings_label(
+                "Disable background for waves",
+                Some("Hide track artwork behind the player waveform."),
+            ),
+            settings_switch(
+                s.disable_wave_background,
+                Message::SetPref(Pref::DisableWaveBackground(!s.disable_wave_background)),
+            ),
         ));
         playback.push(settings_row(
             format!("playback track speeds playback speed saved reset {speeds_desc}"),
@@ -770,7 +905,6 @@ impl App {
                 Message::SettingsBypassToggled(!s.bypass_unavailable),
             ),
         ));
-        let proxy_changed = self.proxy_draft.trim() != s.proxy.as_deref().unwrap_or("");
         unlock.push(settings_row(
             "unlock your own proxy socks5 http https network user password".into(),
             settings_label(
@@ -780,17 +914,12 @@ impl App {
                      protocol://user:pass@host:port (http, https, socks5).",
                 ),
             ),
-            column![
-                settings_input(
-                    "socks5://127.0.0.1:9050",
-                    &self.proxy_draft,
-                    Message::SettingsProxyChanged,
-                    Some(Message::SettingsSave),
-                ),
-                settings_outline_btn("Save", proxy_changed.then_some(Message::SettingsSave)),
-            ]
-            .spacing(8)
-            .align_x(iced::Alignment::End),
+            settings_input(
+                "socks5://127.0.0.1:9050",
+                &self.proxy_draft,
+                Message::SettingsProxyChanged,
+                Some(Message::SettingsSave),
+            ),
         ));
         sections.extend(settings_section("Unlock", unlock, &query));
 
@@ -868,7 +997,10 @@ impl App {
             vec![
                 settings_row(
                     "updates check automatically when Wavify starts".into(),
-                    settings_label("Check updates", Some("Check for new Wavify releases at startup")),
+                    settings_label(
+                        "Check updates",
+                        Some("Check for new Wavify releases at startup"),
+                    ),
                     settings_switch(
                         s.check_updates,
                         Message::SetPref(Pref::CheckUpdates(!s.check_updates)),
@@ -878,7 +1010,11 @@ impl App {
                     "updates check now current version".into(),
                     settings_label("Check for updates now", None),
                     settings_outline_btn(
-                        if self.update_checking { "Checking…" } else { "Check updates now" },
+                        if self.update_checking {
+                            "Checking…"
+                        } else {
+                            "Check updates now"
+                        },
                         (!self.update_checking).then_some(Message::CheckUpdates),
                     ),
                 ),
@@ -886,34 +1022,58 @@ impl App {
             &query,
         ));
 
+        let mut window_options = vec![
+            settings_row(
+                "startup open automatically log into computer login windows".into(),
+                settings_label(
+                    "Open Wavify automatically after you log into the computer",
+                    None,
+                ),
+                settings_select(
+                    vec![
+                        LoginChoice(OpenAtLogin::No),
+                        LoginChoice(OpenAtLogin::Minimized),
+                        LoginChoice(OpenAtLogin::Yes),
+                    ],
+                    LoginChoice(s.open_at_login),
+                    |c| Message::SetPref(Pref::OpenAtLogin(c.0)),
+                ),
+            ),
+            settings_row(
+                "window close button minimize".into(),
+                settings_label("Close button should minimize the Wavify window", None),
+                settings_switch(
+                    s.close_minimizes,
+                    Message::SetPref(Pref::CloseMinimizes(!s.close_minimizes)),
+                ),
+            ),
+            settings_row(
+                "debug mode console server requests responses payloads diagnostics logs".into(),
+                settings_label(
+                    "Debug mode",
+                    Some("On the next launch, show a console and save detailed server requests, responses, links, and payloads. Credentials are redacted."),
+                ),
+                settings_switch(
+                    s.debug_mode,
+                    Message::SetPref(Pref::DebugMode(!s.debug_mode)),
+                ),
+            ),
+        ];
+        #[cfg(windows)]
+        window_options.push(settings_row(
+            "window close hide to system tray background keep running".into(),
+            settings_label(
+                "Allow Wavify in the system tray",
+                Some("Closing hides the window but keeps Wavify running. Open it or quit from the tray icon."),
+            ),
+            settings_switch(
+                s.allow_system_tray,
+                Message::SetPref(Pref::AllowSystemTray(!s.allow_system_tray)),
+            ),
+        ));
         sections.extend(settings_section(
             "Startup and window behaviour",
-            vec![
-                settings_row(
-                    "startup open automatically log into computer login windows".into(),
-                    settings_label(
-                        "Open Wavify automatically after you log into the computer",
-                        None,
-                    ),
-                    settings_select(
-                        vec![
-                            LoginChoice(OpenAtLogin::No),
-                            LoginChoice(OpenAtLogin::Minimized),
-                            LoginChoice(OpenAtLogin::Yes),
-                        ],
-                        LoginChoice(s.open_at_login),
-                        |c| Message::SetPref(Pref::OpenAtLogin(c.0)),
-                    ),
-                ),
-                settings_row(
-                    "window close button minimize".into(),
-                    settings_label("Close button should minimize the Wavify window", None),
-                    settings_switch(
-                        s.close_minimizes,
-                        Message::SetPref(Pref::CloseMinimizes(!s.close_minimizes)),
-                    ),
-                ),
-            ],
+            window_options,
             &query,
         ));
 
@@ -1295,16 +1455,6 @@ where
             selected_background: Background::Color(BG_TINT_HI),
         })
         .into()
-}
-
-/// "5 h 12 min", the time left until a moment (ms since the epoch).
-fn time_left(until_ms: u64) -> String {
-    let mins = until_ms.saturating_sub(crate::config::now_ms()) / 60_000;
-    if mins >= 60 {
-        format!("{} h {} min", mins / 60, mins % 60)
-    } else {
-        format!("{} min", mins.max(1))
-    }
 }
 
 /// The equalizer's graph: each band a point at its gain, joined by lines

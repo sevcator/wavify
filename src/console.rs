@@ -13,6 +13,15 @@ pub fn attach() {
     }
 }
 
+/// Show a console for the GUI app when persistent Debug mode was enabled.
+pub fn show() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::AllocConsole;
+        let _ = AllocConsole();
+    }
+}
+
 /// `--debug`: every log! line also goes to a file of this process's own
 /// (<config>/debug/<time>_<role>_<pid>.log), secrets masked. Child processes
 /// (sign-in, captcha, YouTube Music windows) inherit it through WAVIFY_DEBUG.
@@ -99,6 +108,124 @@ pub fn log(msg: &str) {
     }
 }
 
+/// Persist an untruncated, credential-redacted diagnostic block. Full network
+/// bodies are written to the debug file, not stderr, to keep the live console
+/// usable while still retaining the payload for diagnosis.
+pub fn detail(label: &str, payload: &str) {
+    if !debug_enabled() {
+        return;
+    }
+    let payload = sanitize_payload(payload);
+    let Some(file) = DEBUG_FILE.get() else { return };
+    let at = STARTED
+        .get()
+        .map(|started| started.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "[{at:>9.3}] --- {label} ---");
+        for line in payload.lines() {
+            let _ = writeln!(file, "[{at:>9.3}] {}", redact(line));
+        }
+        let _ = file.flush();
+    }
+}
+
+pub fn http_request(method: &str, url: &str, body: Option<&serde_json::Value>) {
+    if !debug_enabled() {
+        return;
+    }
+    let mut block = format!("{method} {}", redact(url));
+    if let Some(body) = body {
+        block.push_str("\nPayload:\n");
+        block.push_str(
+            &serde_json::to_string_pretty(&sanitize_json(body.clone()))
+                .unwrap_or_else(|_| "<could not serialize payload>".into()),
+        );
+    }
+    detail("HTTP REQUEST", &block);
+}
+
+pub fn http_request_raw(method: &str, url: &str, body: Option<&[u8]>) {
+    if !debug_enabled() {
+        return;
+    }
+    let mut block = format!("{method} {}", redact(url));
+    if let Some(body) = body {
+        block.push_str("\nPayload:\n");
+        block.push_str(&sanitize_payload(&String::from_utf8_lossy(body)));
+    }
+    detail("HTTP REQUEST", &block);
+}
+
+pub fn http_response(method: &str, url: &str, status: impl std::fmt::Display, body: &[u8]) {
+    if !debug_enabled() {
+        return;
+    }
+    let body = sanitize_payload(&String::from_utf8_lossy(body));
+    detail(
+        "HTTP RESPONSE",
+        &format!("{method} {} -> {status}\nBody:\n{body}", redact(url)),
+    );
+}
+
+pub fn http_binary_response(
+    method: &str,
+    url: &str,
+    status: impl std::fmt::Display,
+    content_type: Option<&str>,
+    byte_count: usize,
+) {
+    detail(
+        "HTTP BINARY RESPONSE",
+        &format!(
+            "{method} {} -> {status}; content-type={}; bytes={byte_count} (body omitted)",
+            redact(url),
+            content_type.unwrap_or("unknown")
+        ),
+    );
+}
+
+fn sanitize_payload(payload: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+        serde_json::to_string_pretty(&sanitize_json(value)).unwrap_or_else(|_| redact(payload))
+    } else {
+        redact(payload)
+    }
+}
+
+fn sanitize_json(mut value: serde_json::Value) -> serde_json::Value {
+    fn visit(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    let key_lower = key.to_ascii_lowercase();
+                    if key_lower.contains("token")
+                        || key_lower.contains("secret")
+                        || key_lower.contains("password")
+                        || key_lower.contains("cookie")
+                        || key_lower.contains("authorization")
+                        || key_lower.contains("captcha")
+                        || key_lower == "policy"
+                        || key_lower == "signature"
+                        || key_lower == "key-pair-id"
+                        || key_lower.starts_with("x-amz-")
+                        || key_lower == "code"
+                    {
+                        *value = serde_json::Value::String("[redacted]".into());
+                    } else {
+                        visit(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(visit),
+            serde_json::Value::String(text) => *text = redact(text),
+            _ => {}
+        }
+    }
+    visit(&mut value);
+    value
+}
+
 /// Very long words (a captcha's multi-kilobyte query strings) cut to their
 /// first 300 characters; the rest of the line stays.
 fn shorten(line: &str) -> String {
@@ -123,10 +250,15 @@ fn shorten(line: &str) -> String {
 /// ids become "[redacted]", so a debug log can be shared.
 pub fn redact(s: &str) -> String {
     // (marker, the value runs until one of these)
-    const KEYS: [&str; 14] = [
+    const KEYS: [&str; 26] = [
         "oauth_token=",
         "access_token=",
         "refresh_token=",
+        "token=",
+        "session_token=",
+        "password=",
+        "client_secret=",
+        "authorization=",
         "\"access_token\":\"",
         "\"refresh_token\":\"",
         "code=",
@@ -135,6 +267,13 @@ pub fn redact(s: &str) -> String {
         "webtoken=",
         "cid=",
         "initialCid=",
+        "Policy=",
+        "Signature=",
+        "Key-Pair-Id=",
+        "X-Amz-Credential=",
+        "X-Amz-Signature=",
+        "X-Amz-Security-Token=",
+        "jwt=",
         "OAuth ",
         "Bearer ",
         "\"cookie\":\"",
@@ -202,7 +341,7 @@ macro_rules! dlog {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{redact, sanitize_payload};
 
     #[test]
     fn secrets_are_masked() {
@@ -219,9 +358,24 @@ mod tests {
             "Authorization: OAuth [redacted]"
         );
         assert_eq!(
+            redact("https://cdn.example/stream?Policy=signed&Signature=secret&keep=yes"),
+            "https://cdn.example/stream?Policy=[redacted]&Signature=[redacted]&keep=yes"
+        );
+        assert_eq!(
             redact(r#"{"access_token":"tok","expires_in":3}"#),
             r#"{"access_token":"[redacted]","expires_in":3}"#
         );
         assert_eq!(redact("nothing here"), "nothing here");
+    }
+
+    #[test]
+    fn detailed_payloads_keep_user_content_but_redact_credentials() {
+        let safe = sanitize_payload(
+            r#"{"comment":{"body":"hello"},"session":{"access_token":"secret","refresh_token":"refresh"},"url":"https://x/?oauth_token=secret"}"#,
+        );
+        assert!(safe.contains("hello"));
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains("refresh\""));
+        assert!(safe.contains("[redacted]"));
     }
 }

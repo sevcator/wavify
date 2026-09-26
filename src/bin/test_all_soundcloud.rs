@@ -437,7 +437,7 @@ async fn run_test() -> Result<()> {
         "GET station_for_track (track radio)",
         || async {
             let st = api.station_for_track(test_track.id, &cid).await?;
-            Ok(st.len())
+            Ok(st.0.len())
         },
     )
     .await?;
@@ -450,7 +450,7 @@ async fn run_test() -> Result<()> {
         "GET station_for_artist (artist radio)",
         || async {
             let st = api.station_for_artist(target_artist_id, &cid).await?;
-            Ok(st.len())
+            Ok(st.0.len())
         },
     )
     .await?;

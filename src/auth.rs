@@ -212,6 +212,11 @@ pub async fn complete_login(code: String) -> Result<()> {
         serde_json::from_str(&std::fs::read_to_string(auth_pending_path())?)?;
     let _ = std::fs::remove_file(auth_pending_path());
     let settings = Settings::load();
+    if let Some(proxy) = settings.proxy.as_deref().filter(|proxy| !proxy.is_empty()) {
+        crate::proxy_pool::verify_configured_proxy(proxy).await?;
+    } else if !crate::proxy_pool::soundcloud_reachable_directly().await {
+        bail!("SoundCloud is not reachable directly; configure a working proxy in Wavify before completing sign-in");
+    }
     let auth = Auth::new(&settings)?;
     auth.exchange_code(&code, &pending.verifier).await?;
     Ok(())
