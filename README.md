@@ -16,8 +16,7 @@
   <br>
   <a href="https://t.me/sevcator/921">📢 Telegram Channel</a> | 
   <a href="https://t.me/sevcator/909">💸 Donate</a>
-</div>
-
-<p align="center">
+  <br>
+  <br>
   <img src="assets/preview.png" alt="Wavify Preview" width="800">
 </p>
