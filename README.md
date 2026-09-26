@@ -19,9 +19,13 @@
   <br>
   <br>
   <img src="assets/preview.png" alt="Wavify Preview" width="800">
+  <br>
+  <br>
+  No browser. Everything native
 </div>
 
 ## Features:
-- Spotify Theme
+- Spotify Theme + features like Crossfade tracks, Equalizer and etc.
 - Unlock unavailable tracks (through YouTube Music and proxy)
 - Offline listening / caching
+- Discord Rich Presence
