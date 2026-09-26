@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (must match Cargo.toml, for example v0.1.0)
+        description: Release tag (must match Cargo.toml, for example v0.2.0)
         required: true
         type: string
 
@@ -75,4 +75,12 @@ jobs:
           $notes = Get-Content CHANGELOG.md -Raw
           $notesPath = Join-Path $env:RUNNER_TEMP 'wavify-release-notes.md'
           Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8
-          gh release create $tag 'dist/Wavify-Setup.exe' --repo '${{ github.repository }}' --title "Wavify $tag" --notes-file $notesPath --target '${{ github.sha }}' --latest
+          $repo = '${{ github.repository }}'
+          gh release view $tag --repo $repo 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $tag --repo $repo --title "Wavify $tag" --notes-file $notesPath --latest
+            if ($LASTEXITCODE -ne 0) { throw 'Could not update the existing GitHub release' }
+            gh release upload $tag 'dist/Wavify-Setup.exe' --repo $repo --clobber
+          } else {
+            gh release create $tag 'dist/Wavify-Setup.exe' --repo $repo --title "Wavify $tag" --notes-file $notesPath --target '${{ github.sha }}' --latest
+          }
