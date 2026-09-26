@@ -21,7 +21,7 @@
   <img src="assets/preview.png" alt="Wavify Preview" width="800">
   <br>
   <br>
-  No browser. Everything native
+  No browser. Everything native.
 </div>
 
 ## Features:
