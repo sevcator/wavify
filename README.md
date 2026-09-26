@@ -21,7 +21,7 @@
   <img src="assets/preview.png" alt="Wavify Preview" width="800">
 </div>
 
-# Features:
+## Features:
 - Spotify Theme
 - Unlock unavailable tracks (through YouTube Music and proxy)
 - Offline listening / caching
