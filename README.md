@@ -11,7 +11,7 @@
 <h1 align="center">Wavify</h1>
 
 <div align="center">
-  Free Spotify for your Desktop devices! (but this SoundCloud)
+  SoundCloud app for Desktop devices
   <br>
   <br>
   <a href="https://t.me/sevcator/921">📢 Telegram Channel</a> | 
@@ -20,3 +20,8 @@
   <br>
   <img src="assets/preview.png" alt="Wavify Preview" width="800">
 </p>
+
+## Features:
+- Spotify Theme
+- Unlock unavailable tracks (through YouTube Music and proxy)
+- Offline listening / caching
